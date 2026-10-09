@@ -1,0 +1,140 @@
+import 'dart:async';
+
+import 'package:go_router/go_router.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:material_ui/material_ui.dart';
+
+import '../../../extension/community_channel_extension.dart';
+import '../../../i18n/strings.g.dart';
+import '../../../model/account.dart';
+import '../../../model/tab_settings.dart';
+import '../../../provider/api/channel_notifier_provider.dart';
+import '../../../provider/post_notifier_provider.dart';
+import '../../../provider/server_url_notifier_provider.dart';
+import '../../../util/copy_text.dart';
+import '../../../util/future_with_dialog.dart';
+import '../../../util/launch_url.dart';
+import '../../dialog/channel_mute_dialog.dart';
+import '../../widget/timeline_list_view.dart';
+import 'channel_featured.dart';
+import 'channel_home.dart';
+
+class const ChannelPage({
+  super.key,
+  required final Account account,
+  required final String channelId,
+}) extends ConsumerWidget {
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final channel = ref
+        .watch(channelNotifierProvider(account, channelId))
+        .value;
+    final serverUrl = ref.watch(serverUrlNotifierProvider(account.host));
+    final url = serverUrl.replace(pathSegments: ['channels', channelId]);
+
+    return DefaultTabController(
+      length: 3,
+      initialIndex: 1,
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(channel?.name ?? ''),
+          bottom: TabBar(
+            tabs: [
+              Tab(text: t.misskey.overview),
+              Tab(text: t.misskey.timeline),
+              Tab(text: t.misskey.featured),
+            ],
+          ),
+          actions: [
+            PopupMenuButton<void>(
+              itemBuilder: (context) => [
+                PopupMenuItem(
+                  onTap: () =>
+                      context.push('/$account/search?channelId=$channelId'),
+                  child: ListTile(
+                    leading: const Icon(Icons.search),
+                    title: Text(t.misskey.search),
+                  ),
+                ),
+                PopupMenuItem(
+                  onTap: () => launchUrl(ref, url),
+                  child: ListTile(
+                    leading: const Icon(Icons.open_in_browser),
+                    title: Text(t.aria.openInBrowser),
+                  ),
+                ),
+                PopupMenuItem(
+                  onTap: () => copyToClipboard(context, url.toString()),
+                  child: ListTile(
+                    leading: const Icon(Icons.copy),
+                    title: Text(t.misskey.copyLink),
+                  ),
+                ),
+                if (channel?.isMuting case final isMuting?)
+                  if (isMuting)
+                    PopupMenuItem(
+                      onTap: () => futureWithDialog(
+                        context,
+                        ref
+                            .read(
+                              channelNotifierProvider(
+                                account,
+                                channelId,
+                              ).notifier,
+                            )
+                            .unmute(),
+                      ),
+                      child: ListTile(
+                        leading: const Icon(Icons.visibility),
+                        title: Text(t.misskey.unmute),
+                      ),
+                    )
+                  else
+                    PopupMenuItem(
+                      onTap: () => showDialog<void>(
+                        context: context,
+                        builder: (context) => ChannelMuteDialog(
+                          account: account,
+                          channelId: channelId,
+                        ),
+                      ),
+                      child: ListTile(
+                        leading: const Icon(Icons.visibility_off),
+                        title: Text(t.misskey.mute),
+                      ),
+                    ),
+              ],
+            ),
+          ],
+        ),
+        body: TabBarView(
+          children: [
+            ChannelHome(account: account, channelId: channelId),
+            TimelineListView(
+              tabSettings: TabSettings.channel(account, channelId),
+            ),
+            ChannelFeatured(account: account, channelId: channelId),
+          ],
+        ),
+        floatingActionButton: account.isGuest
+            ? null
+            : FloatingActionButton.extended(
+                onPressed: () async {
+                  final channel = await ref.read(
+                    channelNotifierProvider(account, channelId).future,
+                  );
+                  unawaited(
+                    ref
+                        .read(postNotifierProvider(account).notifier)
+                        .setChannel(channel.toNoteChannelInfo()),
+                  );
+                  if (!context.mounted) return;
+                  await context.push('/$account/post');
+                },
+                label: Text(t.misskey.postToTheChannel),
+                icon: const Icon(Icons.edit),
+              ),
+      ),
+    );
+  }
+}

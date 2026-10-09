@@ -1,0 +1,812 @@
+import 'dart:ui';
+
+import 'package:collection/collection.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_hooks/flutter_hooks.dart' hide useTabController;
+import 'package:go_router/go_router.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:material_ui/material_ui.dart';
+
+import '../../constant/shortcuts.dart';
+import '../../extension/scroll_controller_extension.dart';
+import '../../hook/tab_controller_hook.dart';
+import '../../i18n/strings.g.dart';
+import '../../model/account.dart';
+import '../../model/general_settings.dart';
+import '../../model/sound_settings.dart';
+import '../../model/tab_settings.dart';
+import '../../provider/api/i_notifier_provider.dart';
+import '../../provider/api/timeline_notes_after_note_notifier_provider.dart';
+import '../../provider/emojis_notifier_provider.dart';
+import '../../provider/general_settings_notifier_provider.dart';
+import '../../provider/misskey_colors_provider.dart';
+import '../../provider/misskey_sfx_notifier_provider.dart';
+import '../../provider/post_notifier_provider.dart';
+import '../../provider/timeline_center_notifier_provider.dart';
+import '../../provider/timeline_notes_queue_notifier_provider.dart';
+import '../../provider/timeline_scroll_controller_provider.dart';
+import '../../provider/timeline_tab_index_notifier_provider.dart';
+import '../../provider/timeline_tab_settings_provider.dart';
+import '../../provider/timeline_tabs_notifier_provider.dart';
+import '../../util/lookup.dart';
+import '../../util/reload_timeline.dart';
+import '../dialog/text_field_dialog.dart';
+import '../widget/mfm_keyboard.dart';
+import '../widget/post_form.dart';
+import '../widget/timeline_drawer.dart';
+import '../widget/timeline_tab_bar.dart';
+import '../widget/timeline_widget.dart';
+import '../widget/user_avatar.dart';
+
+class const TimelinesPage({super.key}) extends HookConsumerWidget {
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final tabs = ref.watch(timelineTabsNotifierProvider);
+    final numTabs = tabs.length;
+    final tabIndex = ref.watch(timelineTabIndexNotifierProvider);
+    final tabSettings = ref.watch(timelineTabSettingsProvider);
+    final (
+      showTimelineTabBarAtBottom,
+      showMenuButtonInTabBar,
+      buttonTypes,
+      mini,
+      square,
+      enableHorizontalSwipe,
+      stiffness,
+      minFlingFactor,
+      enableHapticFeedback,
+    ) = ref.watch(
+      generalSettingsNotifierProvider.select(
+        (settings) => (
+          settings.showTimelineTabBarAtBottom,
+          settings.showMenuButtonInTabBar ||
+              !settings.timelinesPageButtonTypes
+                  .take(5)
+                  .contains(TimelinesPageButtonType.menu),
+          settings.timelinesPageButtonTypes,
+          settings.showSmallTimelinesPageButtons,
+          settings.showSquaredTimelinesPageButtons,
+          settings.enableHorizontalSwipe,
+          settings.timelinesPageSpringStiffness,
+          settings.timelinesPageMinFlingFactor,
+          settings.enableHapticFeedback,
+        ),
+      ),
+    );
+    final controller = useTabController(
+      initialLength: numTabs,
+      initialIndex: useMemoized(() => tabIndex, [numTabs]),
+      keys: [numTabs],
+    );
+    final showPostForm = useState(false);
+    final isClosingPostForm = useRef(false);
+    useEffect(() {
+      int previousIndex = tabIndex;
+      int index = tabIndex;
+
+      void callback() {
+        if (tabs.isEmpty) return;
+        final int nextIndex;
+        if (controller.index != previousIndex) {
+          nextIndex = controller.index;
+          if (controller.offset == 0.0) {
+            previousIndex = controller.index;
+          }
+        } else {
+          nextIndex = controller.animation?.value.round() ?? index;
+        }
+        if (nextIndex == index) return;
+        ref
+            .read(misskeySfxNotifierProvider(OperationType.tabSwitch).notifier)
+            .play()
+            .ignore();
+        ref
+            .read(timelineTabIndexNotifierProvider.notifier)
+            .updateIndex(nextIndex);
+        final previousTab = tabs[index];
+        final previousAccount = previousTab.account;
+        final nextTab = tabs[nextIndex];
+        final nextAccount = nextTab.account;
+        index = nextIndex;
+        if (!nextAccount.isGuest) {
+          ref
+              .read(postNotifierProvider(nextAccount).notifier)
+              .switchTab(previousTab, nextTab);
+        }
+        if (previousAccount != nextAccount) {
+          if (previousAccount.host != nextAccount.host) {
+            ref
+                .read(emojisNotifierProvider(nextAccount.host).notifier)
+                .reloadEmojis();
+          }
+          if (!nextAccount.isGuest) {
+            ref.invalidate(iNotifierProvider(nextAccount));
+          }
+        }
+        if (nextAccount.isGuest) {
+          showPostForm.value = false;
+        }
+      }
+
+      if (tabSettings != null) {
+        final account = tabSettings.account;
+        ref.read(emojisNotifierProvider(account.host).notifier).reloadEmojis();
+      }
+      controller.animation?.addListener(callback);
+      return () => controller.animation?.removeListener(callback);
+    }, [tabs, enableHapticFeedback]);
+    final isLargeScreen = MediaQuery.sizeOf(context).width > 1200.0;
+    final rootFocusNode = useFocusNode();
+    final postFormFocusNode = useFocusNode();
+    final colors = ref.watch(
+      misskeyColorsProvider(Theme.of(context).brightness),
+    );
+
+    return FocusableActionDetector(
+      autofocus: true,
+      focusNode: rootFocusNode,
+      shortcuts: {
+        postActivatorN: VoidCallbackIntent(() {
+          if (tabSettings != null && !tabSettings.account.isGuest) {
+            showPostForm.value = true;
+            postFormFocusNode.requestFocus();
+          }
+        }),
+        postActivatorP: VoidCallbackIntent(() {
+          if (tabSettings != null && !tabSettings.account.isGuest) {
+            showPostForm.value = true;
+            postFormFocusNode.requestFocus();
+          }
+        }),
+        dismissActivator: VoidCallbackIntent(
+          () => rootFocusNode.requestFocus(),
+        ),
+      },
+      child: Row(
+        children: [
+          if (isLargeScreen)
+            DrawerTheme(
+              data: DrawerThemeData(
+                backgroundColor: colors.panel,
+                elevation: 0.0,
+                shape: const RoundedRectangleBorder(),
+              ),
+              child: TimelineDrawer(controller: controller),
+            ),
+          Expanded(
+            child: AnnotatedRegion<SystemUiOverlayStyle>(
+              value: SystemUiOverlayStyle(
+                statusBarColor: colors.panel,
+                statusBarIconBrightness:
+                    Theme.of(context).brightness == Brightness.dark
+                    ? Brightness.light
+                    : Brightness.dark,
+                statusBarBrightness: Theme.of(context).brightness,
+              ),
+              child: Scaffold(
+                appBar: showTimelineTabBarAtBottom
+                    ? null
+                    : AppBar(
+                        automaticallyImplyLeading:
+                            !isLargeScreen && showMenuButtonInTabBar,
+                        title: TimelineTabBar(controller: controller),
+                        titleSpacing: 0.0,
+                        centerTitle: true,
+                      ),
+                body: Stack(
+                  children: [
+                    Positioned(
+                      top: 0.0,
+                      left: 0.0,
+                      right: 0.0,
+                      height: MediaQuery.paddingOf(context).top,
+                      child: ColoredBox(color: colors.panel),
+                    ),
+                    SafeArea(
+                      bottom: false,
+                      child: numTabs == 0
+                          ? Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Padding(
+                                    padding: const EdgeInsets.all(8.0),
+                                    child: Text(t.aria.noTabs),
+                                  ),
+                                  ElevatedButton(
+                                    onPressed: () =>
+                                        context.push('/settings/tab'),
+                                    child: Text(t.aria.addTab),
+                                  ),
+                                ],
+                              ),
+                            )
+                          : Stack(
+                              alignment: Alignment.bottomCenter,
+                              children: [
+                                NotificationListener<UserScrollNotification>(
+                                  onNotification: (notification) {
+                                    if (showPostForm.value &&
+                                        !isClosingPostForm.value &&
+                                        notification.metrics.axis ==
+                                            Axis.vertical &&
+                                        notification.direction !=
+                                            ScrollDirection.idle) {
+                                      isClosingPostForm.value = true;
+                                      primaryFocus?.unfocus();
+                                      Future<void>.delayed(
+                                        const Duration(milliseconds: 180),
+                                        () {
+                                          if (context.mounted) {
+                                            showPostForm.value = false;
+                                          }
+                                          isClosingPostForm.value = false;
+                                        },
+                                      );
+                                    }
+                                    return false;
+                                  },
+                                  child: TabBarView(
+                                    controller: controller,
+                                    physics: enableHorizontalSwipe
+                                        ? ClampingScrollPhysics(
+                                            parent: _TimelinesPageScrollPhysics(
+                                              spring:
+                                                  SpringDescription.withDampingRatio(
+                                                    mass: 0.5,
+                                                    stiffness: stiffness,
+                                                    ratio: 1.1,
+                                                  ),
+                                              minFlingDistance:
+                                                  kTouchSlop * minFlingFactor,
+                                              minFlingVelocity:
+                                                  kMinFlingVelocity *
+                                                  minFlingFactor,
+                                            ),
+                                          )
+                                        : const NeverScrollableScrollPhysics(),
+                                    children: List.generate(
+                                      numTabs,
+                                      (index) => TimelineWidget(
+                                        tabIndex: index,
+                                        focusPostForm: () {
+                                          showPostForm.value = true;
+                                          postFormFocusNode.requestFocus();
+                                        },
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                AnimatedSwitcher(
+                                  duration: const Duration(milliseconds: 360),
+                                  reverseDuration: const Duration(
+                                    milliseconds: 280,
+                                  ),
+                                  switchInCurve: Curves.easeOutCubic,
+                                  switchOutCurve: Curves.easeInCubic,
+                                  transitionBuilder: (child, animation) {
+                                    final position = Tween<Offset>(
+                                      begin: const Offset(0.0, 0.35),
+                                      end: Offset.zero,
+                                    ).animate(animation);
+                                    return SlideTransition(
+                                      position: position,
+                                      child: FadeTransition(
+                                        opacity: animation,
+                                        child: child,
+                                      ),
+                                    );
+                                  },
+                                  layoutBuilder:
+                                      (currentChild, previousChildren) {
+                                        return Stack(
+                                          alignment: Alignment.bottomCenter,
+                                          children: [
+                                            ...previousChildren,
+                                            // ignore: use_null_aware_elements
+                                            if (currentChild case final child?)
+                                              child,
+                                          ],
+                                        );
+                                      },
+                                  child:
+                                      tabSettings != null && showPostForm.value
+                                      ? KeyedSubtree(
+                                          key: const ValueKey('post-form-open'),
+                                          child: Material(
+                                            clipBehavior: Clip.hardEdge,
+                                            color: colors.panel.withValues(
+                                              alpha: 0.5,
+                                            ),
+                                            child: BackdropFilter(
+                                              filter: ImageFilter.blur(
+                                                sigmaX: 16.0,
+                                                sigmaY: 16.0,
+                                              ),
+                                              child: DecoratedBox(
+                                                decoration: BoxDecoration(
+                                                  border: Border(
+                                                    top: BorderSide(
+                                                      color: colors.divider
+                                                          .withValues(
+                                                            alpha: 0.1,
+                                                          ),
+                                                      width: 2.0,
+                                                    ),
+                                                  ),
+                                                ),
+                                                child: SafeArea(
+                                                  child: _PostForm(
+                                                    account:
+                                                        tabSettings.account,
+                                                    focusNode:
+                                                        postFormFocusNode,
+                                                    onHide: () =>
+                                                        showPostForm.value =
+                                                            false,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        )
+                                      : const KeyedSubtree(
+                                          key: ValueKey('post-form-closed'),
+                                          child: SizedBox.shrink(),
+                                        ),
+                                ),
+                              ],
+                            ),
+                    ),
+                  ],
+                ),
+                drawer: TimelineDrawer(controller: controller),
+                bottomNavigationBar: showTimelineTabBarAtBottom
+                    ? BottomAppBar(
+                        padding: EdgeInsets.zero,
+                        height: kToolbarHeight,
+                        color: colors.panel,
+                        elevation: 0.0,
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            border: Border(
+                              top: BorderSide(color: colors.divider),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              if (!isLargeScreen && showMenuButtonInTabBar)
+                                const Padding(
+                                  padding: EdgeInsets.all(8.0),
+                                  child: DrawerButton(),
+                                ),
+                              Expanded(
+                                child: TimelineTabBar(controller: controller),
+                              ),
+                            ],
+                          ),
+                        ),
+                      )
+                    : null,
+                floatingActionButton: tabSettings == null || !showPostForm.value
+                    ? Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        children: buttonTypes
+                            .where(
+                              (type) =>
+                                  !isLargeScreen ||
+                                  type != TimelinesPageButtonType.menu,
+                            )
+                            .mapIndexed(
+                              (index, type) => type != null
+                                  ? _TimelinesPageButton(
+                                      tabSettings: tabSettings,
+                                      buttonType: type,
+                                      index: index,
+                                      mini: mini,
+                                      square: square,
+                                      showPostForm: () =>
+                                          showPostForm.value = true,
+                                    )
+                                  : SizedBox.square(
+                                      dimension: mini ? 40.0 : 56.0,
+                                    ),
+                            )
+                            .toList(),
+                      )
+                    : const SizedBox.shrink(),
+                floatingActionButtonLocation: mini
+                    ? FloatingActionButtonLocation.miniCenterFloat
+                    : FloatingActionButtonLocation.centerFloat,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class const _PostForm({
+  required final Account account,
+  required final FocusNode focusNode,
+  required final void Function() onHide,
+}) extends HookConsumerWidget {
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final account = useState(this.account);
+    final draft = ref.watch(postNotifierProvider(account.value));
+    final cwController = useTextEditingController(text: draft.cw);
+    final controller = useTextEditingController(text: draft.text);
+    final hashtagController = useTextEditingController(text: draft.hashtag);
+    final cwFocusNode = useFocusNode();
+    final focusNode = this.focusNode;
+    final hashtagFocusNode = useFocusNode();
+    final isCwFocused = useState(false);
+    final isFocused = useState(false);
+    final isHashtagFocused = useState(false);
+    useEffect(() {
+      void cwFocusNodeCallback() {
+        isCwFocused.value = cwFocusNode.hasFocus;
+      }
+
+      void focusNodeCallback() {
+        isFocused.value = focusNode.hasFocus;
+      }
+
+      void hashtagFocusNodeCallback() {
+        isHashtagFocused.value = hashtagFocusNode.hasFocus;
+      }
+
+      cwFocusNode.addListener(cwFocusNodeCallback);
+      focusNode.addListener(focusNodeCallback);
+      hashtagFocusNode.addListener(hashtagFocusNodeCallback);
+
+      return () {
+        cwFocusNode.removeListener(cwFocusNodeCallback);
+        focusNode.removeListener(focusNodeCallback);
+        hashtagFocusNode.removeListener(hashtagFocusNodeCallback);
+      };
+    }, []);
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Flexible(
+          child: SingleChildScrollView(
+            child: PostForm(
+              account: this.account,
+              cwController: cwController,
+              controller: controller,
+              hashtagController: hashtagController,
+              cwFocusNode: cwFocusNode,
+              focusNode: focusNode,
+              hashtagFocusNode: hashtagFocusNode,
+              onHide: onHide,
+              onExpand: (account) => context.push('/$account/post'),
+              onAccountChanged: (newAccount) => account.value = newAccount,
+              showPostButton: true,
+              maxLines: 6,
+              thumbnailSize: 100.0,
+            ),
+          ),
+        ),
+        Visibility(
+          visible: isCwFocused.value,
+          maintainState: true,
+          child: TextFieldTapRegion(
+            onTapOutside: (_) => primaryFocus?.unfocus(),
+            child: MfmKeyboard(
+              account: account.value,
+              controller: cwController,
+            ),
+          ),
+        ),
+        Visibility(
+          visible: isFocused.value,
+          maintainState: true,
+          child: TextFieldTapRegion(
+            onTapOutside: (_) => primaryFocus?.unfocus(),
+            child: MfmKeyboard(account: account.value, controller: controller),
+          ),
+        ),
+        Visibility(
+          visible: isHashtagFocused.value,
+          maintainState: true,
+          child: TextFieldTapRegion(
+            onTapOutside: (_) => primaryFocus?.unfocus(),
+            child: MfmHashtagKeyboard(
+              account: account.value,
+              controller: hashtagController,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class const _TimelinesPageButton({
+  required final TabSettings? tabSettings,
+  required final TimelinesPageButtonType buttonType,
+  final int? index,
+  final bool mini = false,
+  final bool square = false,
+  final void Function()? showPostForm,
+}) extends ConsumerWidget {
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final account = tabSettings?.account;
+    final i = account != null
+        ? ref.watch(iNotifierProvider(account)).value
+        : null;
+    final colors = ref.watch(
+      misskeyColorsProvider(Theme.of(context).brightness),
+    );
+
+    final requireTabSettings = switch (buttonType) {
+      TimelinesPageButtonType.menu || TimelinesPageButtonType.settings => false,
+      _ => true,
+    };
+    final requireCredencial = switch (buttonType) {
+      TimelinesPageButtonType.announcements => false,
+      TimelinesPageButtonType.antennas => true,
+      TimelinesPageButtonType.chat => true,
+      TimelinesPageButtonType.channels => false,
+      TimelinesPageButtonType.clips => true,
+      TimelinesPageButtonType.drive => true,
+      TimelinesPageButtonType.explore => false,
+      TimelinesPageButtonType.favorites => true,
+      TimelinesPageButtonType.gallery => false,
+      TimelinesPageButtonType.games => false,
+      TimelinesPageButtonType.home => false,
+      TimelinesPageButtonType.instanceInfo => false,
+      TimelinesPageButtonType.lists => true,
+      TimelinesPageButtonType.lookup => true,
+      TimelinesPageButtonType.menu => false,
+      TimelinesPageButtonType.notifications => true,
+      TimelinesPageButtonType.pages => false,
+      TimelinesPageButtonType.play => false,
+      TimelinesPageButtonType.postForm => true,
+      TimelinesPageButtonType.note => true,
+      TimelinesPageButtonType.profile => true,
+      TimelinesPageButtonType.reload => false,
+      TimelinesPageButtonType.search => false,
+      TimelinesPageButtonType.settings => false,
+    };
+    final disabled =
+        (requireTabSettings && tabSettings == null) ||
+        (requireCredencial && (tabSettings?.account.isGuest ?? true));
+    final primary = buttonType == TimelinesPageButtonType.note;
+
+    final tooltip = switch (buttonType) {
+      TimelinesPageButtonType.announcements => t.misskey.announcements,
+      TimelinesPageButtonType.antennas => t.misskey.antennas,
+      TimelinesPageButtonType.chat => t.misskey.directMessage_short,
+      TimelinesPageButtonType.channels => t.misskey.channel,
+      TimelinesPageButtonType.clips => t.misskey.clips,
+      TimelinesPageButtonType.drive => t.misskey.drive,
+      TimelinesPageButtonType.explore => t.misskey.explore,
+      TimelinesPageButtonType.favorites => t.misskey.favorites,
+      TimelinesPageButtonType.gallery => t.misskey.gallery,
+      TimelinesPageButtonType.games => 'Misskey Games',
+      TimelinesPageButtonType.home => t.misskey.home,
+      TimelinesPageButtonType.instanceInfo => t.misskey.instanceInfo,
+      TimelinesPageButtonType.lists => t.misskey.lists,
+      TimelinesPageButtonType.lookup => t.misskey.lookup,
+      TimelinesPageButtonType.menu => t.misskey.menu,
+      TimelinesPageButtonType.note => t.misskey.note,
+      TimelinesPageButtonType.notifications => t.misskey.notifications,
+      TimelinesPageButtonType.pages => t.misskey.pages,
+      TimelinesPageButtonType.play => 'Play',
+      TimelinesPageButtonType.postForm => t.misskey.widgets_.postForm,
+      TimelinesPageButtonType.profile => t.misskey.profile,
+      TimelinesPageButtonType.reload => t.misskey.reload,
+      TimelinesPageButtonType.search => t.misskey.search,
+      TimelinesPageButtonType.settings => t.misskey.settings,
+    };
+    final onPressed = switch (buttonType) {
+      TimelinesPageButtonType.announcements => () => context.push(
+        '/$account/announcements',
+      ),
+      TimelinesPageButtonType.antennas => () => context.push(
+        '/$account/antennas',
+      ),
+      TimelinesPageButtonType.channels => () => context.push(
+        '/$account/channels',
+      ),
+      TimelinesPageButtonType.chat => () => context.push('/$account/chat'),
+      TimelinesPageButtonType.clips => () => context.push('/$account/clips'),
+      TimelinesPageButtonType.drive => () => context.push('/$account/drive'),
+      TimelinesPageButtonType.explore => () => context.push(
+        '/$account/explore',
+      ),
+      TimelinesPageButtonType.favorites => () => context.push(
+        '/$account/favorites',
+      ),
+      TimelinesPageButtonType.gallery => () => context.push(
+        '/$account/gallery',
+      ),
+      TimelinesPageButtonType.games => () => context.push('/$account/games'),
+      TimelinesPageButtonType.home => () {
+        final tabSettings = this.tabSettings!;
+        final scrollController = ref.read(
+          timelineScrollControllerProvider(tabSettings),
+        );
+        final notes = ref
+            .read(timelineNotesQueueNotifierProvider(tabSettings).notifier)
+            .popMany(100);
+        if (notes.isNotEmpty) {
+          final centerId = ref.read(
+            timelineCenterNotifierProvider(tabSettings),
+          );
+          ref
+              .read(
+                timelineNotesAfterNoteNotifierProvider(
+                  tabSettings,
+                  sinceId: centerId,
+                ).notifier,
+              )
+              .addNotes(notes);
+        }
+        WidgetsBinding.instance.addPostFrameCallback(
+          (_) => scrollController.scrollToTop(),
+        );
+      },
+      TimelinesPageButtonType.instanceInfo => () => context.push(
+        '/$account/servers/${account!.host}',
+      ),
+      TimelinesPageButtonType.lists => () => context.push('/$account/lists'),
+      TimelinesPageButtonType.lookup => () async {
+        final result = await showTextFieldDialog(
+          context,
+          title: Text(t.misskey.lookup),
+        );
+        if (!context.mounted) return;
+        if (result == null) return;
+        await lookup(ref, account!, result.trim());
+      },
+      TimelinesPageButtonType.menu => () => Scaffold.of(context).openDrawer(),
+      TimelinesPageButtonType.note => () => context.push('/$account/post'),
+      TimelinesPageButtonType.notifications => () => context.push(
+        '/$account/notifications',
+      ),
+      TimelinesPageButtonType.pages => () => context.push('/$account/pages'),
+      TimelinesPageButtonType.play => () => context.push('/$account/play'),
+      TimelinesPageButtonType.postForm => showPostForm,
+      TimelinesPageButtonType.profile => () => context.push(
+        '/$account/@${account!.username}',
+      ),
+      TimelinesPageButtonType.reload => () => reloadTimeline(ref, tabSettings!),
+      TimelinesPageButtonType.search => () => context.push('/$account/search'),
+      TimelinesPageButtonType.settings => () => context.push('/settings'),
+    };
+    final child = switch (buttonType) {
+      TimelinesPageButtonType.announcements => Stack(
+        children: [
+          const Icon(Icons.campaign),
+          if (i?.hasUnreadAnnouncement ?? false)
+            DecoratedBox(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              child: const SizedBox(height: 12.0, width: 12.0),
+            ),
+        ],
+      ),
+      TimelinesPageButtonType.antennas => const Icon(
+        Icons.settings_input_antenna,
+      ),
+      TimelinesPageButtonType.channels => const Icon(Icons.tv),
+      TimelinesPageButtonType.chat => Stack(
+        children: [
+          const Icon(Icons.message),
+          if (i?.hasUnreadChatMessages ?? false)
+            DecoratedBox(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              child: const SizedBox(height: 12.0, width: 12.0),
+            ),
+        ],
+      ),
+      TimelinesPageButtonType.clips => const Icon(Icons.attach_file),
+      TimelinesPageButtonType.drive => const Icon(Icons.cloud),
+      TimelinesPageButtonType.explore => const Icon(Icons.tag),
+      TimelinesPageButtonType.favorites => const Icon(Icons.star_rounded),
+      TimelinesPageButtonType.gallery => const Icon(Icons.collections),
+      TimelinesPageButtonType.games => const Icon(Icons.games),
+      TimelinesPageButtonType.home => const Icon(Icons.home),
+      TimelinesPageButtonType.instanceInfo => const Icon(Icons.dns),
+      TimelinesPageButtonType.lists => const Icon(Icons.list),
+      TimelinesPageButtonType.lookup => const Icon(Icons.travel_explore),
+      TimelinesPageButtonType.menu => const Icon(Icons.menu),
+      TimelinesPageButtonType.note => Ink(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: [
+              colors.buttonGradateA.withValues(alpha: !disabled ? 0.9 : 0.5),
+              colors.buttonGradateB.withValues(alpha: !disabled ? 0.9 : 0.5),
+            ],
+          ),
+          borderRadius: BorderRadius.circular(
+            square
+                ? mini
+                      ? 12.0
+                      : 16.0
+                : 32.0,
+          ),
+        ),
+        child: Padding(
+          padding: EdgeInsets.all(mini ? 8.0 : 16.0),
+          child: const Icon(Icons.edit),
+        ),
+      ),
+      TimelinesPageButtonType.notifications => Stack(
+        children: [
+          const Icon(Icons.notifications),
+          if (i?.hasUnreadNotification ?? false)
+            DecoratedBox(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: colors.accent,
+              ),
+              child: const SizedBox(height: 12.0, width: 12.0),
+            ),
+        ],
+      ),
+      TimelinesPageButtonType.pages => const Icon(Icons.article),
+      TimelinesPageButtonType.play => const Icon(Icons.play_arrow),
+      TimelinesPageButtonType.postForm => const Icon(Icons.keyboard),
+      TimelinesPageButtonType.profile =>
+        account != null && i != null
+            ? UserAvatar(account: account, user: i, size: 28.0)
+            : const Icon(Icons.person),
+      TimelinesPageButtonType.reload => const Icon(Icons.refresh),
+      TimelinesPageButtonType.search => const Icon(Icons.search),
+      TimelinesPageButtonType.settings => const Icon(Icons.settings),
+    };
+
+    return FloatingActionButton(
+      heroTag: ValueKey('<_TimelinesPageButton tag $index>'),
+      tooltip: tooltip,
+      foregroundColor: (primary ? colors.fgOnAccent : colors.fg).withValues(
+        alpha: !disabled ? 0.9 : 0.5,
+      ),
+      backgroundColor: primary
+          ? Colors.transparent
+          : colors.panel.withValues(alpha: !disabled ? 0.9 : 0.5),
+      disabledElevation: 0.0,
+      shape: square ? null : const CircleBorder(),
+      mini: mini,
+      onPressed: !disabled ? onPressed : null,
+      child: child,
+    );
+  }
+}
+
+class const _TimelinesPageScrollPhysics({
+  super.parent,
+  @override
+  final SpringDescription spring = const SpringDescription(
+    mass: 0.5,
+    stiffness: 100.0,
+    damping: 15.556349186104047,
+  ),
+  @override final double minFlingDistance = kTouchSlop,
+  @override final double minFlingVelocity = kMinFlingVelocity,
+}) extends ScrollPhysics {
+  @override
+  _TimelinesPageScrollPhysics applyTo(ScrollPhysics? ancestor) {
+    return _TimelinesPageScrollPhysics(
+      parent: buildParent(ancestor),
+      spring: spring,
+      minFlingDistance: minFlingDistance,
+      minFlingVelocity: minFlingVelocity,
+    );
+  }
+}

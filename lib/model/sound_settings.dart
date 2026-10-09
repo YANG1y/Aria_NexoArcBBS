@@ -1,0 +1,128 @@
+import 'package:collection/collection.dart';
+import 'package:freezed_annotation/freezed_annotation.dart';
+
+part 'sound_settings.freezed.dart';
+part 'sound_settings.g.dart';
+
+enum SoundType {
+  syuiloNAec,
+  syuiloNAec4va,
+  syuiloNAec4vb,
+  syuiloNAec8va,
+  syuiloNAec8vb,
+  syuiloNCea,
+  syuiloNCea4va,
+  syuiloNCea4vb,
+  syuiloNCea8va,
+  syuiloNCea8vb,
+  syuiloNEca,
+  syuiloNEca4va,
+  syuiloNEca4vb,
+  syuiloNEca8va,
+  syuiloNEca8vb,
+  syuiloNEa,
+  syuiloNEa4va,
+  syuiloNEa4vb,
+  syuiloNEa8va,
+  syuiloNEa8vb,
+  syuiloNEaHarmony,
+  syuiloUp,
+  syuiloDown,
+  syuiloPope1,
+  syuiloPope2,
+  syuiloWaon,
+  syuiloPopo,
+  syuiloTriple,
+  syuiloBubble1,
+  syuiloBubble2,
+  syuiloPoi1,
+  syuiloPoi2,
+  syuiloPirori,
+  syuiloPiroriWet,
+  syuiloPiroriSquareWet,
+  syuiloSquarePico,
+  syuiloReverved,
+  syuiloRyukyu,
+  syuiloKick,
+  syuiloSnare,
+  syuiloQueueJammed,
+  aisha1,
+  aisha2,
+  aisha3,
+  noizenecioKickGaba1,
+  noizenecioKickGaba2,
+  noizenecioKickGaba3,
+  noizenecioKickGaba4,
+  noizenecioKickGaba5,
+  noizenecioKickGaba6,
+  noizenecioKickGaba7,
+}
+
+enum OperationType {
+  noteMy,
+  note,
+  notification,
+  reaction,
+  chatMessage,
+  tabSwitch,
+  reloadHold,
+  reload,
+}
+
+const defaultMasterVolume = 0.5;
+const defaultSounds = {
+  OperationType.noteMy: SoundStore(type: SoundType.syuiloNCea4va),
+  OperationType.note: SoundStore(type: SoundType.syuiloNAec),
+  OperationType.notification: SoundStore(type: SoundType.syuiloNEa),
+  OperationType.reaction: SoundStore(type: SoundType.syuiloBubble2),
+  OperationType.chatMessage: SoundStore(type: SoundType.syuiloWaon),
+  OperationType.tabSwitch: SoundStore(type: SoundType.syuiloPoi1),
+  OperationType.reloadHold: SoundStore(type: SoundType.syuiloPopo),
+  OperationType.reload: SoundStore(type: SoundType.syuiloPope2),
+};
+
+@freezed
+@JsonSerializable()
+class const SoundSettings({
+  final bool notUseSound = false,
+  final double masterVolume = defaultMasterVolume,
+  final Map<OperationType, SoundStore> sounds = defaultSounds,
+}) with _$SoundSettings {
+  factory fromJson(Map<String, Object?> json) => SoundSettings(
+    notUseSound: switch (json['notUseSound']) {
+      final bool notUseSound => notUseSound,
+      _ => false,
+    },
+    masterVolume: switch (json['masterVolume']) {
+      final num masterVolume => masterVolume.toDouble(),
+      _ => defaultMasterVolume,
+    },
+    sounds: switch (json['sounds']) {
+      final Map<String, dynamic> sounds => {
+        for (final MapEntry(:key, :Map<String, dynamic> value)
+            in sounds.entries)
+          ?_$OperationTypeEnumMap.entries
+              .firstWhereOrNull((e) => e.value == key)
+              ?.key: SoundStore.fromJson(
+            value,
+          ),
+      },
+      _ => defaultSounds,
+    },
+  );
+
+  Map<String, Object?> toJson() => _$SoundSettingsToJson(this);
+}
+
+@freezed
+@JsonSerializable()
+class const SoundStore({
+  @JsonKey(unknownEnumValue: JsonKey.nullForUndefinedEnumValue)
+  final SoundType? type,
+  final double volume = 1.0,
+  final bool vibrate = false,
+}) with _$SoundStore {
+  factory fromJson(Map<String, Object?> json) => _$SoundStoreFromJson(json);
+
+  Map<String, Object?> toJson() => _$SoundStoreToJson(this);
+}

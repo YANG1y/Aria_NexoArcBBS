@@ -1,0 +1,915 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:ui';
+
+import 'package:async/async.dart';
+import 'package:collection/collection.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_apns_only/flutter_apns_only.dart';
+import 'package:flutter_hooks/flutter_hooks.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:misskey_dart/misskey_dart.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:shared_preferences/util/legacy_to_async_migration_util.dart';
+import 'package:unifiedpush/unifiedpush.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:webpush_encryption/webpush_encryption.dart';
+import 'package:window_manager/window_manager.dart';
+
+import 'constant/colors.dart';
+import 'constant/shortcuts.dart';
+import 'extension/app_locale_utils_extension.dart';
+import 'extension/user_extension.dart';
+import 'gen/assets.gen.dart';
+import 'hook/on_window_move_hook.dart';
+import 'hook/on_window_moved_hook.dart';
+import 'hook/on_window_resize_hook.dart';
+import 'hook/on_window_resized_hook.dart';
+import 'i18n/strings.g.dart';
+import 'model/account.dart';
+import 'model/id.dart';
+import 'provider/apns_push_connector_provider.dart';
+import 'provider/cache_manager_provider.dart';
+import 'provider/general_settings_notifier_provider.dart';
+import 'provider/notification_settings_repository_provider.dart';
+import 'provider/push_notification_notifier_provider.dart';
+import 'provider/server_url_notifier_provider.dart';
+import 'provider/shared_preferences_provider.dart';
+import 'provider/theme_data_provider.dart';
+import 'provider/unified_push_endpoint_notifier_provider.dart';
+import 'provider/user_ids_notifier_provider.dart';
+import 'provider/web_push_key_set_notifier_provider.dart';
+import 'provider/window_position_repository_provider.dart';
+import 'provider/window_size_repository_provider.dart';
+import 'repository/window_position_repository.dart';
+import 'repository/window_size_repository.dart';
+import 'router/router.dart';
+import 'util/get_retry_delay.dart';
+import 'util/twemoji.dart';
+import 'view/dialog/error_message_dialog.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  if (defaultTargetPlatform == TargetPlatform.android) {
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  }
+  LicenseRegistry.addLicense(() async* {
+    for (final asset in Assets.emojis.values) {
+      yield LicenseEntryWithLineBreaks([
+        'emojis',
+      ], await rootBundle.loadString(asset));
+    }
+    yield LicenseEntryWithLineBreaks([
+      'BIZ UDGothic',
+    ], await rootBundle.loadString(Assets.fonts.bIZUDGothic.ofl));
+    yield LicenseEntryWithLineBreaks([
+      'Noto Serif JP',
+    ], await rootBundle.loadString(Assets.fonts.notoSerifJP.ofl));
+    yield LicenseEntryWithLineBreaks([
+      'Pretendard',
+    ], await rootBundle.loadString(Assets.fonts.pretendard.license));
+    yield LicenseEntryWithLineBreaks([
+      'Twemoji Mozilla',
+    ], await rootBundle.loadString(Assets.fonts.twemojiMozilla.license));
+    for (final asset in Assets.misskey.values) {
+      yield LicenseEntryWithLineBreaks([
+        'Misskey',
+      ], await rootBundle.loadString(asset));
+    }
+    for (final asset in Assets.twemoji.values) {
+      yield LicenseEntryWithLineBreaks([
+        'Twemoji',
+      ], await rootBundle.loadString(asset));
+    }
+  });
+  late final SharedPreferencesWithCache prefs;
+  try {
+    prefs = await SharedPreferencesWithCache.create(
+      cacheOptions: const SharedPreferencesWithCacheOptions(),
+    );
+  } on FormatException {
+    if (defaultTargetPlatform
+        case TargetPlatform.linux || TargetPlatform.windows) {
+      final directory = await getApplicationSupportDirectory();
+      await File(p.join(directory.path, 'shared_preferences.json'))
+          .rename(p.join(directory.path, '_shared_preferences.json'));
+      prefs = await SharedPreferencesWithCache.create(
+        cacheOptions: const SharedPreferencesWithCacheOptions(),
+      );
+    } else {
+      rethrow;
+    }
+  }
+  const migrationCompletedKey = 'migrationCompleted';
+  if (!prefs.containsKey(migrationCompletedKey)) {
+    await migrateLegacySharedPreferencesToSharedPreferencesAsyncIfNecessary(
+      legacySharedPreferencesInstance: await SharedPreferences.getInstance(),
+      sharedPreferencesAsyncOptions: const SharedPreferencesOptions(),
+      migrationCompletedKey: migrationCompletedKey,
+    );
+    await prefs.reloadCache();
+  }
+  if (defaultTargetPlatform
+      case TargetPlatform.linux ||
+          TargetPlatform.macOS ||
+          TargetPlatform.windows) {
+    await windowManager.ensureInitialized();
+    final size = WindowSizeRepository(prefs).getSize();
+    final position = WindowPositionRepository(prefs).getPosition();
+    final options = WindowOptions(size: size);
+    await windowManager.waitUntilReadyToShow(options, () async {
+      if (position != null) {
+        await windowManager.setPosition(position);
+      }
+      await windowManager.show();
+      await windowManager.focus();
+    });
+  }
+  runApp(
+    ProviderScope(
+      overrides: [sharedPreferencesProvider.overrideWithValue(prefs)],
+      retry: getRetryDelay,
+      child: TranslationProvider(child: const Aria()),
+    ),
+  );
+}
+
+class const Aria({super.key}) extends HookConsumerWidget {
+  Future<void> _init(WidgetRef ref) async {
+    final generalSettings = ref.read(generalSettingsNotifierProvider);
+    Future(() {
+      final locale =
+          generalSettings.locale ?? AppLocaleUtils.instance.findDeviceLocale();
+      LocaleSettings.instance.setLocale(locale);
+    }).ignore();
+    if (generalSettings.keepScreenOn) {
+      WakelockPlus.enable().ignore();
+    }
+
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      final flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
+      await flutterLocalNotificationsPlugin.initialize(
+        settings: const InitializationSettings(
+          android: AndroidInitializationSettings('ic_notification'),
+        ),
+        onDidReceiveNotificationResponse: (response) =>
+            _onDidReceiveNotificationResponse(ref, response),
+      );
+
+      await UnifiedPush.initialize(
+        onNewEndpoint: (endpoint, instance) => ref
+            .read(unifiedPushEndpointNotifierProvider(instance).notifier)
+            .updateEndpoint(endpoint),
+        onRegistrationFailed: (reason, instance) {
+          ref
+              .read(unifiedPushEndpointNotifierProvider(instance).notifier)
+              .remove();
+          showErrorMessageDialog(ref.context, error: reason);
+        },
+        onUnregistered: (instance) => ref
+            .read(unifiedPushEndpointNotifierProvider(instance).notifier)
+            .remove(),
+        onMessage: (message, instance) async {
+          Account account = Account.fromString(instance);
+          final PushNotification notification;
+          if (message.decrypted) {
+            final webPushMessage = jsonDecode(
+              utf8.decode(message.content),
+            ) as Map<String, dynamic>;
+            notification = PushNotification.fromJson(webPushMessage);
+          } else {
+            final keySet = await ref.read(
+              webPushKeySetNotifierProvider(account).future,
+            );
+            if (keySet != null) {
+              final decrypted = await WebPush().decrypt(
+                keySet,
+                message.content,
+              );
+              final webPushMessage =
+                  jsonDecode(utf8.decode(decrypted)) as Map<String, dynamic>;
+              notification = PushNotification.fromJson(webPushMessage);
+            } else {
+              final fcmMessage = jsonDecode(
+                utf8.decode(message.content),
+              ) as Map<String, dynamic>;
+              if (fcmMessage['body'] case final String body) {
+                fcmMessage['body'] = jsonDecode(body);
+              }
+              if (fcmMessage['dateTime'] case final String dateTime) {
+                fcmMessage['dateTime'] = int.tryParse(dateTime);
+              }
+              notification = PushNotification.fromJson(fcmMessage);
+              account =
+                  ref
+                      .read(userIdsNotifierProvider)
+                      .entries
+                      .firstWhereOrNull((e) => e.value == notification.userId)
+                      ?.key ??
+                  account;
+            }
+          }
+
+          final currentLocale = LocaleSettings.currentLocale;
+          if (generalSettings.locale case final locale?) {
+            if (locale != currentLocale) {
+              await LocaleSettings.setLocale(locale);
+            }
+          } else if (AppLocaleUtils.instance.findDeviceLocale()
+              case final locale when locale != currentLocale) {
+            await LocaleSettings.setLocale(locale);
+          }
+
+          final acct = account.toString();
+
+          final channel = switch (notification) {
+            NotificationPushNotification(:final body) => switch (body.type) {
+              NotificationType.note => AndroidNotificationChannel(
+                '$account/note',
+                t.misskey.notification_.types_.note,
+                groupId: acct,
+              ),
+              NotificationType.follow => AndroidNotificationChannel(
+                '$account/follow',
+                t.misskey.notification_.types_.follow,
+                groupId: acct,
+              ),
+              NotificationType.mention => AndroidNotificationChannel(
+                '$account/mention',
+                t.misskey.notification_.types_.mention,
+                groupId: acct,
+              ),
+              NotificationType.reply => AndroidNotificationChannel(
+                '$account/reply',
+                t.misskey.notification_.types_.reply,
+                groupId: acct,
+              ),
+              NotificationType.renote => AndroidNotificationChannel(
+                '$account/renote',
+                t.misskey.notification_.types_.renote,
+                groupId: acct,
+              ),
+              NotificationType.quote => AndroidNotificationChannel(
+                '$account/quote',
+                t.misskey.notification_.types_.quote,
+                groupId: acct,
+              ),
+              NotificationType.reaction => AndroidNotificationChannel(
+                '$account/reaction',
+                t.misskey.notification_.types_.reaction,
+                groupId: acct,
+              ),
+              NotificationType.pollEnded => AndroidNotificationChannel(
+                '$account/pollEnded',
+                t.misskey.notification_.types_.pollEnded,
+                groupId: acct,
+              ),
+              NotificationType.scheduledNotePosted =>
+                AndroidNotificationChannel(
+                  '$account/scheduledNotePosted',
+                  t.misskey.notification_.types_.scheduledNotePosted,
+                  groupId: acct,
+                ),
+              NotificationType.scheduledNotePostFailed ||
+              NotificationType.scheduleNote ||
+              NotificationType.scheduledNoteError => AndroidNotificationChannel(
+                '$account/scheduledNotePostFailed',
+                t.misskey.notification_.types_.scheduledNotePostFailed,
+                groupId: acct,
+              ),
+              NotificationType.receiveFollowRequest =>
+                AndroidNotificationChannel(
+                  '$account/receiveFollowRequest',
+                  t.misskey.notification_.types_.receiveFollowRequest,
+                  groupId: acct,
+                ),
+              NotificationType.followRequestAccepted =>
+                AndroidNotificationChannel(
+                  '$account/followRequestAccepted',
+                  t.misskey.notification_.types_.followRequestAccepted,
+                  groupId: acct,
+                ),
+              NotificationType.roleAssigned => AndroidNotificationChannel(
+                '$account/roleAssigned',
+                t.misskey.notification_.types_.roleAssigned,
+                groupId: acct,
+              ),
+              NotificationType.chatRoomInvitationReceived =>
+                AndroidNotificationChannel(
+                  '$account/chatRoomInvitationReceived',
+                  t.misskey.notification_.types_.chatRoomInvitationReceived,
+                  groupId: acct,
+                ),
+              NotificationType.achievementEarned => AndroidNotificationChannel(
+                '$account/achievementEarned',
+                t.misskey.notification_.types_.achievementEarned,
+                groupId: acct,
+              ),
+              NotificationType.exportCompleted => AndroidNotificationChannel(
+                '$account/exportCompleted',
+                t.misskey.notification_.types_.exportCompleted,
+                groupId: acct,
+              ),
+              NotificationType.login => AndroidNotificationChannel(
+                '$account/login',
+                t.misskey.notification_.types_.login,
+                groupId: acct,
+              ),
+              NotificationType.createToken => AndroidNotificationChannel(
+                '$account/createToken',
+                t.misskey.notification_.types_.createToken,
+                groupId: acct,
+              ),
+              NotificationType.app => AndroidNotificationChannel(
+                '$account/app',
+                t.misskey.notification_.types_.app,
+                groupId: acct,
+              ),
+              NotificationType.test => AndroidNotificationChannel(
+                '$account/test',
+                t.misskey.notification_.types_.test,
+                groupId: acct,
+              ),
+              NotificationType.edited ||
+              NotificationType.noteScheduled ||
+              NotificationType.reactionGrouped ||
+              NotificationType.renoteGrouped ||
+              NotificationType.noteGrouped ||
+              NotificationType.pollVote ||
+              NotificationType.groupInvited ||
+              null => AndroidNotificationChannel(
+                '$account/other',
+                t.misskey.other,
+                groupId: acct,
+              ),
+            },
+            ReadAllNotificationsPushNotification() =>
+              AndroidNotificationChannel(
+                '$account/other',
+                t.misskey.other,
+                groupId: acct,
+              ),
+            NewChatMessagePushNotification() => AndroidNotificationChannel(
+              '$account/newChatMessage',
+              t.misskey.directMessage,
+              groupId: acct,
+            ),
+          };
+          await flutterLocalNotificationsPlugin
+              .resolvePlatformSpecificImplementation<
+                AndroidFlutterLocalNotificationsPlugin
+              >()
+              ?.createNotificationChannel(channel);
+
+          final title = switch (notification) {
+            NotificationPushNotification(:final body) => switch (body.type) {
+              NotificationType.follow =>
+                t.misskey.notification_.youWereFollowed,
+              NotificationType.mention => t.misskey.notification_.youGotMention(
+                name: body.user?.nameOrUsername ?? '',
+              ),
+              NotificationType.reply => t.misskey.notification_.youGotReply(
+                name: body.user?.nameOrUsername ?? '',
+              ),
+              NotificationType.renote => t.misskey.notification_.youRenoted(
+                name: body.user?.nameOrUsername ?? '',
+              ),
+              NotificationType.quote => t.misskey.notification_.youGotQuote(
+                name: body.user?.nameOrUsername ?? '',
+              ),
+              NotificationType.note => t.misskey.notification_.newNote,
+              NotificationType.reaction => [
+                body.reaction?.split('@')[0].replaceAll(':', ''),
+                body.user?.nameOrUsername,
+              ].nonNulls.join(' '),
+              NotificationType.receiveFollowRequest =>
+                t.misskey.notification_.youReceivedFollowRequest,
+              NotificationType.followRequestAccepted =>
+                t.misskey.notification_.yourFollowRequestAccepted,
+              NotificationType.achievementEarned =>
+                t.misskey.notification_.achievementEarned,
+              NotificationType.login => t.misskey.notification_.login,
+              NotificationType.exportCompleted =>
+                t.misskey.notification_.exportOfXCompleted(
+                  x: switch (body.exportedEntity) {
+                    UserExportableEntities.antenna => t.misskey.antennas,
+                    UserExportableEntities.blocking => t.misskey.blockedUsers,
+                    UserExportableEntities.clip => t.misskey.clips,
+                    UserExportableEntities.customEmoji =>
+                      t.misskey.customEmojis,
+                    UserExportableEntities.favorite => t.misskey.favorites,
+                    UserExportableEntities.following => t.misskey.following,
+                    UserExportableEntities.muting => t.misskey.mutedUsers,
+                    UserExportableEntities.note => t.misskey.notes,
+                    UserExportableEntities.userList => t.misskey.lists,
+                    null => '',
+                  },
+                ),
+              NotificationType.pollEnded => t.misskey.notification_.pollEnded,
+              NotificationType.roleAssigned =>
+                t.misskey.notification_.roleAssigned,
+              NotificationType.chatRoomInvitationReceived =>
+                t.misskey.notification_.chatRoomInvitationReceived,
+              NotificationType.createToken =>
+                t.misskey.notification_.createToken,
+              NotificationType.scheduledNotePosted =>
+                t.misskey.notification_.scheduledNotePosted,
+              NotificationType.scheduledNotePostFailed ||
+              NotificationType.scheduleNote ||
+              NotificationType.scheduledNoteError =>
+                t.misskey.notification_.scheduledNotePostFailed,
+              NotificationType.noteScheduled => t.aria.noteScheduled,
+              NotificationType.app => body.header ?? body.body,
+              NotificationType.test => t.misskey.notification_.testNotification,
+              NotificationType.edited ||
+              NotificationType.reactionGrouped ||
+              NotificationType.renoteGrouped ||
+              NotificationType.noteGrouped ||
+              NotificationType.pollVote ||
+              NotificationType.groupInvited ||
+              null => null,
+            },
+            ReadAllNotificationsPushNotification() => null,
+            NewChatMessagePushNotification(:final body) =>
+              body.toRoom != null
+                  ? '${body.toRoom?.name}: ${body.fromUser?.nameOrUsername}'
+                  : body.fromUser?.nameOrUsername,
+          };
+          final body = switch (notification) {
+            NotificationPushNotification(:final body) => switch (body.type) {
+              NotificationType.follow ||
+              NotificationType.receiveFollowRequest ||
+              NotificationType.followRequestAccepted =>
+                body.user?.nameOrUsername,
+              NotificationType.mention ||
+              NotificationType.reply ||
+              NotificationType.renote ||
+              NotificationType.quote ||
+              NotificationType.note ||
+              NotificationType.reaction ||
+              NotificationType.pollEnded => body.note?.text,
+              NotificationType.achievementEarned => switch (body.achievement) {
+                'notes1' => t.misskey.achievements_.types_.notes1_.title,
+                'notes10' => t.misskey.achievements_.types_.notes10_.title,
+                'notes100' => t.misskey.achievements_.types_.notes100_.title,
+                'notes500' => t.misskey.achievements_.types_.notes500_.title,
+                'notes1000' => t.misskey.achievements_.types_.notes1000_.title,
+                'notes5000' => t.misskey.achievements_.types_.notes5000_.title,
+                'notes10000' =>
+                  t.misskey.achievements_.types_.notes10000_.title,
+                'notes20000' =>
+                  t.misskey.achievements_.types_.notes20000_.title,
+                'notes30000' =>
+                  t.misskey.achievements_.types_.notes30000_.title,
+                'notes40000' =>
+                  t.misskey.achievements_.types_.notes40000_.title,
+                'notes50000' =>
+                  t.misskey.achievements_.types_.notes50000_.title,
+                'notes60000' =>
+                  t.misskey.achievements_.types_.notes60000_.title,
+                'notes70000' =>
+                  t.misskey.achievements_.types_.notes70000_.title,
+                'notes80000' =>
+                  t.misskey.achievements_.types_.notes80000_.title,
+                'notes90000' =>
+                  t.misskey.achievements_.types_.notes90000_.title,
+                'notes100000' =>
+                  t.misskey.achievements_.types_.notes100000_.title,
+                'login3' => t.misskey.achievements_.types_.login3_.title,
+                'login7' => t.misskey.achievements_.types_.login7_.title,
+                'login15' => t.misskey.achievements_.types_.login15_.title,
+                'login30' => t.misskey.achievements_.types_.login30_.title,
+                'login60' => t.misskey.achievements_.types_.login60_.title,
+                'login100' => t.misskey.achievements_.types_.login100_.title,
+                'login200' => t.misskey.achievements_.types_.login200_.title,
+                'login300' => t.misskey.achievements_.types_.login300_.title,
+                'login400' => t.misskey.achievements_.types_.login400_.title,
+                'login500' => t.misskey.achievements_.types_.login500_.title,
+                'login600' => t.misskey.achievements_.types_.login600_.title,
+                'login700' => t.misskey.achievements_.types_.login700_.title,
+                'login800' => t.misskey.achievements_.types_.login800_.title,
+                'login900' => t.misskey.achievements_.types_.login900_.title,
+                'login1000' => t.misskey.achievements_.types_.login1000_.title,
+                'noteClipped1' =>
+                  t.misskey.achievements_.types_.noteClipped1_.title,
+                'noteFavorited1' =>
+                  t.misskey.achievements_.types_.noteFavorited1_.title,
+                'myNoteFavorited1' =>
+                  t.misskey.achievements_.types_.myNoteFavorited1_.title,
+                'profileFilled' =>
+                  t.misskey.achievements_.types_.profileFilled_.title,
+                'markedAsCat' =>
+                  t.misskey.achievements_.types_.markedAsCat_.title,
+                'following1' =>
+                  t.misskey.achievements_.types_.following1_.title,
+                'following10' =>
+                  t.misskey.achievements_.types_.following10_.title,
+                'following50' =>
+                  t.misskey.achievements_.types_.following50_.title,
+                'following100' =>
+                  t.misskey.achievements_.types_.following100_.title,
+                'following300' =>
+                  t.misskey.achievements_.types_.following300_.title,
+                'followers1' =>
+                  t.misskey.achievements_.types_.followers1_.title,
+                'followers10' =>
+                  t.misskey.achievements_.types_.followers10_.title,
+                'followers50' =>
+                  t.misskey.achievements_.types_.followers50_.title,
+                'followers100' =>
+                  t.misskey.achievements_.types_.followers100_.title,
+                'followers300' =>
+                  t.misskey.achievements_.types_.followers300_.title,
+                'followers500' =>
+                  t.misskey.achievements_.types_.followers500_.title,
+                'followers1000' =>
+                  t.misskey.achievements_.types_.followers1000_.title,
+                'collectAchievements30' =>
+                  t.misskey.achievements_.types_.collectAchievements30_.title,
+                'viewAchievements3min' =>
+                  t.misskey.achievements_.types_.viewAchievements3min_.title,
+                'iLoveMisskey' =>
+                  t.misskey.achievements_.types_.iLoveMisskey_.title,
+                'foundTreasure' =>
+                  t.misskey.achievements_.types_.foundTreasure_.title,
+                'client30min' =>
+                  t.misskey.achievements_.types_.client30min_.title,
+                'client60min' =>
+                  t.misskey.achievements_.types_.client60min_.title,
+                'noteDeletedWithin1min' =>
+                  t.misskey.achievements_.types_.noteDeletedWithin1min_.title,
+                'postedAtLateNight' =>
+                  t.misskey.achievements_.types_.postedAtLateNight_.title,
+                'postedAt0min0sec' =>
+                  t.misskey.achievements_.types_.postedAt0min0sec_.title,
+                'selfQuote' => t.misskey.achievements_.types_.selfQuote_.title,
+                'htl20npm' => t.misskey.achievements_.types_.htl20npm_.title,
+                'viewInstanceChart' =>
+                  t.misskey.achievements_.types_.viewInstanceChart_.title,
+                'outputHelloWorldOnScratchpad' =>
+                  t
+                      .misskey
+                      .achievements_
+                      .types_
+                      .outputHelloWorldOnScratchpad_
+                      .title,
+                'open3windows' =>
+                  t.misskey.achievements_.types_.open3windows_.title,
+                'driveFolderCircularReference' =>
+                  t
+                      .misskey
+                      .achievements_
+                      .types_
+                      .driveFolderCircularReference_
+                      .title,
+                'reactWithoutRead' =>
+                  t.misskey.achievements_.types_.reactWithoutRead_.title,
+                'clickedClickHere' =>
+                  t.misskey.achievements_.types_.clickedClickHere_.title,
+                'justPlainLucky' =>
+                  t.misskey.achievements_.types_.justPlainLucky_.title,
+                'setNameToSyuilo' =>
+                  t.misskey.achievements_.types_.setNameToSyuilo_.title,
+                'passedSinceAccountCreated1' =>
+                  t
+                      .misskey
+                      .achievements_
+                      .types_
+                      .passedSinceAccountCreated1_
+                      .title,
+                'passedSinceAccountCreated2' =>
+                  t
+                      .misskey
+                      .achievements_
+                      .types_
+                      .passedSinceAccountCreated2_
+                      .title,
+                'passedSinceAccountCreated3' =>
+                  t
+                      .misskey
+                      .achievements_
+                      .types_
+                      .passedSinceAccountCreated3_
+                      .title,
+                'loggedInOnBirthday' =>
+                  t.misskey.achievements_.types_.loggedInOnBirthday_.title,
+                'loggedInOnNewYearsDay' =>
+                  t.misskey.achievements_.types_.loggedInOnNewYearsDay_.title,
+                'cookieClicked' =>
+                  t.misskey.achievements_.types_.cookieClicked_.title,
+                'brainDiver' =>
+                  t.misskey.achievements_.types_.brainDiver_.title,
+                'smashTestNotificationButton' =>
+                  t
+                      .misskey
+                      .achievements_
+                      .types_
+                      .smashTestNotificationButton_
+                      .title,
+                'tutorialCompleted' =>
+                  t.misskey.achievements_.types_.tutorialCompleted_.title,
+                'bubbleGameExplodingHead' =>
+                  t.misskey.achievements_.types_.bubbleGameExplodingHead_.title,
+                'bubbleGameDoubleExplodingHead' =>
+                  t
+                      .misskey
+                      .achievements_
+                      .types_
+                      .bubbleGameDoubleExplodingHead_
+                      .title,
+                _ => null,
+              },
+              NotificationType.roleAssigned => body.role?.name,
+              NotificationType.chatRoomInvitationReceived =>
+                body.invitation?.room?.name,
+              NotificationType.createToken =>
+                t.misskey.notification_.createTokenDescription(
+                  text: t.misskey.manageAccessTokens,
+                ),
+              NotificationType.scheduleNote => body.errorType,
+              NotificationType.noteScheduled => body.draft?.data.text,
+              NotificationType.scheduledNotePosted => body.note?.text,
+              NotificationType.scheduledNoteError => body.draft?.reason,
+              NotificationType.app => body.header != null ? body.body : null,
+              NotificationType.test =>
+                t.misskey.notification_.notificationWillBeDisplayedLikeThis,
+              NotificationType.scheduledNotePostFailed ||
+              NotificationType.edited ||
+              NotificationType.exportCompleted ||
+              NotificationType.login ||
+              NotificationType.reactionGrouped ||
+              NotificationType.renoteGrouped ||
+              NotificationType.noteGrouped ||
+              NotificationType.pollVote ||
+              NotificationType.groupInvited ||
+              null => null,
+            },
+            ReadAllNotificationsPushNotification() => null,
+            NewChatMessagePushNotification(:final body) => body.text,
+          };
+
+          final url = switch (notification) {
+            NotificationPushNotification(
+              body: PushNotificationBody(
+                type: NotificationType.reaction,
+                :final note,
+                :final reaction?,
+              ),
+            )
+                when generalSettings.showEmojiInReactionNotification =>
+              reaction.startsWith(':')
+                  ? switch ((
+                      ref.read(serverUrlNotifierProvider(account.host)),
+                      reaction.substring(1, reaction.length - 1),
+                    )) {
+                      (final serverUrl, final emoji) => switch ({
+                        ...?note?.emojis,
+                        ...?note?.reactionEmojis,
+                      }[emoji]) {
+                        final url? => serverUrl.replace(
+                          pathSegments: ['proxy', 'image.webp'],
+                          queryParameters: {'url': url, 'emoji': '1'},
+                        ),
+                        _ => serverUrl.replace(
+                          pathSegments: ['emoji', '$emoji.webp'],
+                        ),
+                      },
+                    }
+                  : getTwemojiUrl(reaction),
+            NotificationPushNotification(:final body) =>
+              body.user?.avatarUrl ?? body.icon,
+            NewChatMessagePushNotification(:final body) =>
+              body.fromUser?.avatarUrl,
+            _ => null,
+          };
+          String? filePath;
+          if (url != null && generalSettings.showImageInNotification) {
+            try {
+              final file = await ref
+                  .read(cacheManagerProvider)
+                  .getSingleFile(url.toString())
+                  .timeout(const Duration(seconds: 10));
+              filePath = file.path;
+            } catch (_) {}
+          }
+
+          await flutterLocalNotificationsPlugin.show(
+            id: DateTime.now().millisecondsSinceEpoch & 0x7fffffff,
+            title: title,
+            body: body,
+            notificationDetails: NotificationDetails(
+              android: AndroidNotificationDetails(
+                channel.id,
+                channel.name,
+                styleInformation: BigTextStyleInformation(body ?? ''),
+                groupKey: acct,
+                groupAlertBehavior: GroupAlertBehavior.children,
+                color: ariaColor,
+                largeIcon: filePath != null
+                    ? FilePathAndroidBitmap(filePath)
+                    : null,
+                when: notification.dateTime?.millisecondsSinceEpoch,
+                subText: acct,
+                tag: switch (notification) {
+                  NotificationPushNotification(
+                    body: PushNotificationBody(:final id),
+                  ) ||
+                  NewChatMessagePushNotification(
+                    body: ChatMessage(:final id),
+                  ) => id,
+                  _ => null,
+                },
+              ),
+            ),
+            payload: jsonEncode(notification),
+          );
+
+          final userId = notification.userId;
+          final summaryId = userId != null
+              ? Id.tryParse(userId)?.date.millisecondsSinceEpoch
+              : null;
+          await flutterLocalNotificationsPlugin.show(
+            id: (summaryId ?? 0) & 0x7fffffff,
+            title: title,
+            body: body,
+            notificationDetails: NotificationDetails(
+              android: AndroidNotificationDetails(
+                channel.id,
+                channel.name,
+                groupKey: acct,
+                setAsGroupSummary: true,
+                groupAlertBehavior: GroupAlertBehavior.children,
+                color: ariaColor,
+                subText: acct,
+              ),
+            ),
+            payload: jsonEncode(
+              ReadAllNotificationsPushNotification(userId: notification.userId),
+            ),
+          );
+        },
+      );
+
+      final appLaunchDetails = await flutterLocalNotificationsPlugin
+          .getNotificationAppLaunchDetails();
+      if (appLaunchDetails?.notificationResponse case final response?) {
+        _onDidReceiveNotificationResponse(ref, response);
+      }
+    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+      Future<void> onMessageOpenedApp(ApnsRemoteMessage message) async {
+        dynamic stringifyKeys(dynamic value) {
+          return switch (value) {
+            final Map<dynamic, dynamic> value => value.map(
+              (key, value) => MapEntry(key.toString(), stringifyKeys(value)),
+            ),
+            final List<dynamic> value => value.map(stringifyKeys).toList(),
+            _ => value,
+          };
+        }
+
+        if (message.payload['data'] case final Map<dynamic, dynamic> data) {
+          if (data['payload'] case final Map<dynamic, dynamic> payload) {
+            final notification = PushNotification.fromJson(
+              payload.map(
+                (key, value) => MapEntry(key.toString(), stringifyKeys(value)),
+              ),
+            );
+            ref
+                .read(pushNotificationNotifierProvider.notifier)
+                .add(notification);
+          }
+        }
+      }
+
+      final connector = ref.read(apnsPushConnectorProvider);
+      connector.configureApns(
+        onLaunch: onMessageOpenedApp,
+        onResume: onMessageOpenedApp,
+      );
+      connector.shouldPresent = (_) async => true;
+    }
+  }
+
+  void _onDidReceiveNotificationResponse(
+    WidgetRef ref,
+    NotificationResponse response,
+  ) {
+    if (response.payload case final payload?) {
+      final json = jsonDecode(payload) as Map<String, dynamic>;
+      final notification = PushNotification.fromJson(json);
+      ref.read(pushNotificationNotifierProvider.notifier).add(notification);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final router = ref.watch(routerProvider);
+    final lightTheme = ref.watch(themeDataProvider(Brightness.light));
+    final darkTheme = ref.watch(themeDataProvider(Brightness.dark));
+    final themeMode = ref.watch(
+      generalSettingsNotifierProvider.select((settings) => settings.themeMode),
+    );
+    useEffect(() {
+      _init(ref);
+      return;
+    }, []);
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+        useOnAppLifecycleStateChange((_, state) async {
+          if (state == AppLifecycleState.resumed) {
+            final appLaunchDetails = await FlutterLocalNotificationsPlugin()
+                .getNotificationAppLaunchDetails();
+            if (appLaunchDetails?.notificationResponse case final response?) {
+              _onDidReceiveNotificationResponse(ref, response);
+            }
+          }
+        });
+      case TargetPlatform.iOS:
+        useOnAppLifecycleStateChange((_, state) {
+          if (state == AppLifecycleState.resumed) {
+            ref.read(notificationSettingsRepositoryProvider).setBadgeCount(0);
+          }
+        });
+      case TargetPlatform.linux:
+        final sizeTimer = useMemoized(
+          () => RestartableTimer(const Duration(seconds: 1), () async {
+            final size = await windowManager.getSize();
+            await ref.read(windowSizeRepositoryProvider).setSize(size);
+          }),
+          [],
+        );
+        final positionTimer = useMemoized(
+          () => RestartableTimer(const Duration(seconds: 1), () async {
+            final position = await windowManager.getPosition();
+            await ref
+                .read(windowPositionRepositoryProvider)
+                .setPosition(position);
+          }),
+          [],
+        );
+        useOnWindowResize(sizeTimer.reset);
+        useOnWindowMove(positionTimer.reset);
+      case TargetPlatform.macOS || TargetPlatform.windows:
+        useOnWindowResized(() async {
+          final size = await windowManager.getSize();
+          await ref.read(windowSizeRepositoryProvider).setSize(size);
+        });
+        useOnWindowMoved(() async {
+          final position = await windowManager.getPosition();
+          await ref
+              .read(windowPositionRepositoryProvider)
+              .setPosition(position);
+        });
+      default:
+    }
+
+    return MaterialApp.router(
+      routerConfig: router,
+      title: 'Aria',
+      theme: lightTheme,
+      darkTheme: darkTheme,
+      themeMode: themeMode,
+      locale: TranslationProvider.of(context).flutterLocale,
+      supportedLocales: AppLocaleUtils.supportedLocales,
+      localizationsDelegates: GlobalMaterialLocalizations.delegates,
+      scrollBehavior: const _AppScrollBehavior(),
+      shortcuts: {
+        ...WidgetsApp.defaultShortcuts,
+        darkModeActivator: VoidCallbackIntent(() {
+          final themeMode = ref.read(generalSettingsNotifierProvider).themeMode;
+          ref.read(generalSettingsNotifierProvider.notifier).setThemeMode(
+            switch (themeMode) {
+              ThemeMode.system || ThemeMode.light => ThemeMode.dark,
+              ThemeMode.dark => ThemeMode.light,
+            },
+          );
+        }),
+        focusUpActivator: const DirectionalFocusIntent(TraversalDirection.up),
+        focusDownActivator: const DirectionalFocusIntent(
+          TraversalDirection.down,
+        ),
+      },
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+class const _AppScrollBehavior() extends MaterialScrollBehavior {
+  @override
+  Widget buildScrollbar(
+    BuildContext context,
+    Widget child,
+    ScrollableDetails details,
+  ) {
+    return child;
+  }
+
+  @override
+  Set<PointerDeviceKind> get dragDevices => PointerDeviceKind.values.toSet();
+}
