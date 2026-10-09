@@ -9,6 +9,7 @@
 - Android applicationId：`com.nexoarc.bbs`
 - 当前版本：`1.5.15 (113)`
 - 联系方式：<https://home.ccoz.top>
+- 原Aria项目地址：https://github.com/poppingmoon/aria
 
 ## 登录与启动
 
